@@ -22,9 +22,9 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/argoproj/argo-cd/gitops-engine/pkg/health"
-	synccommon "github.com/argoproj/argo-cd/gitops-engine/pkg/sync/common"
-	"github.com/argoproj/argo-cd/gitops-engine/pkg/utils/kube"
+	"github.com/argoproj/argo-cd/gitops-engine/v3/pkg/health"
+	synccommon "github.com/argoproj/argo-cd/gitops-engine/v3/pkg/sync/common"
+	"github.com/argoproj/argo-cd/gitops-engine/v3/pkg/utils/kube"
 	"github.com/cespare/xxhash/v2"
 	"github.com/robfig/cron/v3"
 	log "github.com/sirupsen/logrus"
@@ -334,8 +334,36 @@ func (source *ApplicationSource) AllowsConcurrentProcessing() bool {
 	return true
 }
 
+const ociPrefix = "oci://"
+
+// IsOCIURL returns true if the URL is an OCI registry URL. The scheme prefix is matched
+// case-insensitively and surrounding whitespace is ignored, consistent with NormalizeOCIURL,
+// so that classification and normalization always agree.
+func IsOCIURL(url string) bool {
+	trimmed := strings.TrimSpace(url)
+	return len(trimmed) >= len(ociPrefix) && strings.EqualFold(trimmed[:len(ociPrefix)], ociPrefix)
+}
+
+// NormalizeOCIURL returns a canonical representation of an OCI repository URL, suitable
+// for map keys and equality checks. The scheme and host are case-insensitive (RFC 3986)
+// and are lowercased; the repository path is preserved as-is because OCI repository
+// names are case-sensitive. The oci:// prefix is kept to avoid collisions with Git
+// repository URLs. Non-OCI URLs are returned unchanged.
+func NormalizeOCIURL(repoURL string) string {
+	trimmed := strings.TrimSpace(repoURL)
+	if len(trimmed) < len(ociPrefix) || !strings.EqualFold(trimmed[:len(ociPrefix)], ociPrefix) {
+		return repoURL
+	}
+	host, repoPath, hasPath := strings.Cut(trimmed[len(ociPrefix):], "/")
+	normalized := ociPrefix + strings.ToLower(host)
+	if hasPath {
+		normalized += "/" + repoPath
+	}
+	return normalized
+}
+
 func (source *ApplicationSource) IsOCI() bool {
-	return strings.HasPrefix(source.RepoURL, "oci://")
+	return IsOCIURL(source.RepoURL)
 }
 
 // IsRef returns true when the application source is of type Ref
@@ -1955,8 +1983,6 @@ type AppHealthStatus struct {
 	// Status holds the status code of the application
 	Status health.HealthStatusCode `json:"status,omitempty" protobuf:"bytes,1,opt,name=status"`
 	// Message is a human-readable informational message describing the health status
-	//
-	// Deprecated: this field is not used and will be removed in a future release.
 	Message string `json:"message,omitempty" protobuf:"bytes,2,opt,name=message"`
 	// LastTransitionTime is the time the HealthStatus was set or updated
 	LastTransitionTime *metav1.Time `json:"lastTransitionTime,omitempty" protobuf:"bytes,3,opt,name=lastTransitionTime"`

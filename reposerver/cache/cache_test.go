@@ -94,8 +94,8 @@ func TestCache_GetManifests(t *testing.T) {
 	// cache miss
 	q := &apiclient.ManifestRequest{}
 	value := &CachedManifestResponse{}
-	newManifestCacheKeyData := func(revision string, appSource *v1alpha1.ApplicationSource, namespace, appLabelKey, appName string, refSourceCommitSHAs ResolvedRevisions) ManifestKey {
-		return ManifestKey{
+	newManifestCacheKeyData := func(revision string, appSource *v1alpha1.ApplicationSource, namespace, appLabelKey, appName string, refSourceCommitSHAs ResolvedRevisions) manifestKey {
+		return manifestKey{
 			Revision:            revision,
 			AppSource:           appSource,
 			RefSources:          q.RefSources,
@@ -214,7 +214,7 @@ func TestCachedManifestResponse_HashBehavior(t *testing.T) {
 		NumberOfConsecutiveFailures:     0,
 	}
 	q := &apiclient.ManifestRequest{}
-	cacheKeyData := ManifestKey{
+	cacheKeyData := manifestKey{
 		Revision:    response.Revision,
 		AppSource:   appSrc,
 		RefSources:  q.RefSources,
@@ -885,4 +885,19 @@ func TestGetGitFilesChanges(t *testing.T) {
 		assert.Equal(t, expectedItem, files)
 		fixtures.mockCache.AssertCacheCalledTimes(t, &mocks.CacheCallCounts{ExternalGets: 1, ExternalSets: 1})
 	})
+}
+
+func TestGetRefTargetRevisionMappingForCacheKey_OCINormalization(t *testing.T) {
+	// Regression: refSourceCommitSHAs is keyed with NormalizeRepoURL, which preserves the ".git"
+	// suffix for OCI URLs while git.NormalizeGitURL strips it. Looking the digest up with git
+	// normalization missed and blanked TargetRevision, so manifest generation ran at an empty revision.
+	repoURL := "oci://example.com/org/repo.git"
+	mapping := v1alpha1.RefTargetRevisionMapping{
+		"$values": {Repo: v1alpha1.Repository{Repo: repoURL}, TargetRevision: "1.0.0"},
+	}
+	shas := ResolvedRevisions{v1alpha1.NormalizeOCIURL(repoURL): "sha256:digest"}
+
+	res := getRefTargetRevisionMappingForCacheKey(mapping, shas)
+
+	assert.Equal(t, "sha256:digest", res["$values"].TargetRevision)
 }
