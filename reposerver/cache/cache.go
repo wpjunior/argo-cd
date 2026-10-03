@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/argoproj/argo-cd/gitops-engine/pkg/utils/text"
+	"github.com/argoproj/argo-cd/gitops-engine/v3/pkg/utils/text"
 	"github.com/go-git/go-git/v5/plumbing"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
@@ -20,7 +20,6 @@ import (
 	"github.com/argoproj/argo-cd/v3/reposerver/apiclient"
 	cacheutil "github.com/argoproj/argo-cd/v3/util/cache"
 	"github.com/argoproj/argo-cd/v3/util/env"
-	"github.com/argoproj/argo-cd/v3/util/git"
 	"github.com/argoproj/argo-cd/v3/util/hash"
 )
 
@@ -108,9 +107,15 @@ func getRefTargetRevisionMappingForCacheKey(refTargetRevisionMapping appv1.RefTa
 	res := make(refTargetRevisionMappingForCacheKey)
 
 	for k, v := range refTargetRevisionMapping {
-		// forcefully update TargetRevision based on refSourceCommitSHAs so that the resolved revision is always stored in the cache
-		v.TargetRevision = refSourceCommitSHAs[git.NormalizeGitURL(v.Repo.Repo)]
-		res[k] = refTargetForCacheKeyFromRefTarget(v)
+		// Use the resolved revision from refSourceCommitSHAs so that the resolved revision is always stored in the
+		// cache key. NormalizeRepoURL (OCI-aware) must match how refSourceCommitSHAs is keyed when populated.
+		//
+		// Work on a copy: the mapping holds pointers shared with the caller's request, and overwriting
+		// TargetRevision in place would make later ref resolution (e.g. GetAppDetails, which passes no resolved
+		// revisions) operate on a blank or already-resolved revision instead of the one the user configured.
+		target := *v
+		target.TargetRevision = refSourceCommitSHAs[v.Repo.NormalizeRepoURL()]
+		res[k] = refTargetForCacheKeyFromRefTarget(&target)
 	}
 	return res
 }
@@ -119,7 +124,8 @@ func appSourceKey(appSrc *appv1.ApplicationSource, srcRefs appv1.RefTargetRevisi
 	return hash.FNVa(appSourceKeyJSON(appSrc, srcRefs, refSourceCommitSHAs))
 }
 
-// ResolvedRevisions is a map of "normalized git URL" -> "git commit SHA". When one source references another source,
+// ResolvedRevisions is a map of "normalized repository URL" -> "resolved revision" (a Git commit SHA, or an OCI
+// digest for OCI referenced sources; see Repository.NormalizeRepoURL). When one source references another source,
 // the referenced source revision may change, for example, when someone pushes a commit to the referenced branch. This
 // map lets us keep track of the current revision for each referenced source.
 type ResolvedRevisions map[string]string
@@ -328,8 +334,8 @@ func (c *Cache) UnlockGitReferences(repo string, lockId string) error {
 	return err
 }
 
-// ManifestKey carries all fields required to build a manifests cache key.
-type ManifestKey struct {
+// manifestKey carries all fields required to build a manifests cache key.
+type manifestKey struct {
 	Revision       string
 	AppSource      *appv1.ApplicationSource
 	RefSources     appv1.RefTargetRevisionMapping
@@ -345,7 +351,35 @@ type ManifestKey struct {
 	SourceIntegrity     *appv1.SourceIntegrity
 }
 
-func (d ManifestKey) String() string {
+func NewManifestKey(
+	revision string,
+	appSource *appv1.ApplicationSource,
+	refSources map[string]*appv1.RefTarget,
+	namespace string,
+	trackingMethod string,
+	appLabelKey string,
+	appName string,
+	installationID string,
+	sourceIntegrity *appv1.SourceIntegrity,
+	clusterInfo ClusterRuntimeInfo,
+	refSourceCommitSHAs ResolvedRevisions,
+) manifestKey {
+	return manifestKey{
+		Revision:            revision,
+		AppSource:           appSource,
+		RefSources:          refSources,
+		ClusterInfo:         clusterInfo,
+		Namespace:           namespace,
+		TrackingMethod:      trackingMethod,
+		AppLabelKey:         appLabelKey,
+		AppName:             appName,
+		RefSourceCommitSHAs: refSourceCommitSHAs,
+		InstallationID:      installationID,
+		SourceIntegrity:     sourceIntegrity,
+	}
+}
+
+func (d manifestKey) String() string {
 	trackingKey := trackingKey(d.AppLabelKey, d.TrackingMethod)
 	key := fmt.Sprintf("mfst|%s|%s|%s|%s|%d|%s", trackingKey, d.AppName, d.Revision, d.Namespace, appSourceKey(d.AppSource, d.RefSources, d.RefSourceCommitSHAs)+clusterRuntimeInfoKey(d.ClusterInfo), d.SourceIntegrity.CacheKey())
 	if d.InstallationID != "" {
@@ -362,27 +396,12 @@ func trackingKey(appLabelKey string, trackingMethod string) string {
 	return trackingKey
 }
 
-// LogDebugManifestCacheKeyFields logs all the information included in a manifest cache key. It's intended to be run
-// before every manifest cache operation to help debug cache misses.
-func LogDebugManifestCacheKeyFields(message string, reason string, manifestKey ManifestKey) {
-	if log.IsLevelEnabled(log.DebugLevel) {
-		log.WithFields(log.Fields{
-			"revision":    manifestKey.Revision,
-			"appSrc":      appSourceKeyJSON(manifestKey.AppSource, manifestKey.RefSources, manifestKey.RefSourceCommitSHAs),
-			"namespace":   manifestKey.Namespace,
-			"trackingKey": trackingKey(manifestKey.AppLabelKey, manifestKey.TrackingMethod),
-			"appName":     manifestKey.AppName,
-			"clusterInfo": clusterRuntimeInfoKeyUnhashed(manifestKey.ClusterInfo),
-			"reason":      reason,
-		}).Debug(message)
-	}
-}
-
-func (c *Cache) SetNewRevisionManifests(oldKey, newKey ManifestKey) error {
+func (c *Cache) SetNewRevisionManifests(oldKey, newKey manifestKey) error {
 	return c.cache.RenameItem(oldKey.String(), newKey.String(), c.repoCacheExpiration)
 }
 
-func (c *Cache) GetManifests(manifestKey ManifestKey, res *CachedManifestResponse) error {
+func (c *Cache) GetManifests(manifestKey manifestKey, res *CachedManifestResponse) error {
+	logCtx := log.WithField("cacheKey", manifestKey.String())
 	err := c.cache.GetItem(manifestKey.String(), res)
 	if err != nil {
 		return err
@@ -395,9 +414,8 @@ func (c *Cache) GetManifests(manifestKey ManifestKey, res *CachedManifestRespons
 
 	// If cached result does not have manifests or the expected hash of the cache entry does not match the actual hash value...
 	if hash != res.CacheEntryHash || res.ManifestResponse == nil && res.MostRecentError == "" {
-		log.Warnf("Manifest hash did not match expected value or cached manifests response is empty, treating as a cache miss: %s", manifestKey.AppName)
-
-		LogDebugManifestCacheKeyFields("deleting manifests cache", "manifest hash did not match or cached response is empty", manifestKey)
+		logCtx.Warnf("Manifest hash did not match expected value or cached manifests response is empty, treating as a cache miss: %s", manifestKey.AppName)
+		logCtx.Debug("deleting manifests cache: manifest hash did not match or cached response is empty")
 
 		err = c.DeleteManifests(manifestKey)
 		if err != nil {
@@ -419,7 +437,7 @@ func (c *Cache) GetManifests(manifestKey ManifestKey, res *CachedManifestRespons
 	return nil
 }
 
-func (c *Cache) SetManifests(manifestKey ManifestKey, res *CachedManifestResponse) error {
+func (c *Cache) SetManifests(manifestKey manifestKey, res *CachedManifestResponse) error {
 	// Generate and apply the cache entry hash, before writing
 	if res != nil {
 		res = res.shallowCopy()
@@ -439,7 +457,7 @@ func (c *Cache) SetManifests(manifestKey ManifestKey, res *CachedManifestRespons
 		})
 }
 
-func (c *Cache) DeleteManifests(manifestKey ManifestKey) error {
+func (c *Cache) DeleteManifests(manifestKey manifestKey) error {
 	return c.cache.SetItem(
 		manifestKey.String(),
 		"",
@@ -564,6 +582,40 @@ func (c *Cache) GetGitFilesChanges(repoURL, revision, targetRevision string) ([]
 	var files []string
 	err := c.cache.GetItem(getGitFilesChangesKey(repoURL, revision, targetRevision), &files)
 	return files, err
+}
+
+func ociFilesKey(repoURL, revision, pattern string) string {
+	return fmt.Sprintf("ocifiles|%s|%s|%s", repoURL, revision, pattern)
+}
+
+func (c *Cache) SetOciFiles(repoURL, revision, pattern string, files map[string][]byte) error {
+	return c.cache.SetItem(
+		ociFilesKey(repoURL, revision, pattern),
+		&files,
+		&cacheutil.CacheActionOpts{Expiration: c.repoCacheExpiration})
+}
+
+func (c *Cache) GetOciFiles(repoURL, revision, pattern string) (map[string][]byte, error) {
+	var item map[string][]byte
+	err := c.cache.GetItem(ociFilesKey(repoURL, revision, pattern), &item)
+	return item, err
+}
+
+func ociDirectoriesKey(repoURL, revision string) string {
+	return fmt.Sprintf("ocidirs|%s|%s", repoURL, revision)
+}
+
+func (c *Cache) SetOciDirectories(repoURL, revision string, directories []string) error {
+	return c.cache.SetItem(
+		ociDirectoriesKey(repoURL, revision),
+		&directories,
+		&cacheutil.CacheActionOpts{Expiration: c.repoCacheExpiration})
+}
+
+func (c *Cache) GetOciDirectories(repoURL, revision string) ([]string, error) {
+	var item []string
+	err := c.cache.GetItem(ociDirectoriesKey(repoURL, revision), &item)
+	return item, err
 }
 
 func (cmr *CachedManifestResponse) shallowCopy() *CachedManifestResponse {

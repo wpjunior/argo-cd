@@ -94,8 +94,8 @@ func TestCache_GetManifests(t *testing.T) {
 	// cache miss
 	q := &apiclient.ManifestRequest{}
 	value := &CachedManifestResponse{}
-	newManifestCacheKeyData := func(revision string, appSource *v1alpha1.ApplicationSource, namespace, appLabelKey, appName string, refSourceCommitSHAs ResolvedRevisions) ManifestKey {
-		return ManifestKey{
+	newManifestCacheKeyData := func(revision string, appSource *v1alpha1.ApplicationSource, namespace, appLabelKey, appName string, refSourceCommitSHAs ResolvedRevisions) manifestKey {
+		return manifestKey{
 			Revision:            revision,
 			AppSource:           appSource,
 			RefSources:          q.RefSources,
@@ -214,7 +214,7 @@ func TestCachedManifestResponse_HashBehavior(t *testing.T) {
 		NumberOfConsecutiveFailures:     0,
 	}
 	q := &apiclient.ManifestRequest{}
-	cacheKeyData := ManifestKey{
+	cacheKeyData := manifestKey{
 		Revision:    response.Revision,
 		AppSource:   appSrc,
 		RefSources:  q.RefSources,
@@ -395,8 +395,8 @@ func TestGetGitReferences(t *testing.T) {
 		require.NoError(t, err)
 		assert.Empty(t, lockOwner, "Lock owner should be empty")
 		assert.Len(t, references, 1)
-		assert.Equal(t, "test", (references)[0].Target().String())
-		assert.Equal(t, "test-repo", (references)[0].Name().String())
+		assert.Equal(t, "test", references[0].Target().String())
+		assert.Equal(t, "test-repo", references[0].Name().String())
 		fixtures.mockCache.AssertCacheCalledTimes(t, &mocks.CacheCallCounts{ExternalSets: 1, ExternalGets: 1})
 	})
 
@@ -881,6 +881,147 @@ func TestGetGitFilesChanges(t *testing.T) {
 		err := fixtures.cache.SetGitFilesChanges("test-repo", "test-revision", "syncedRevision", expectedItem)
 		require.NoError(t, err)
 		files, err := fixtures.cache.GetGitFilesChanges("test-repo", "test-revision", "syncedRevision")
+		require.NoError(t, err)
+		assert.Equal(t, expectedItem, files)
+		fixtures.mockCache.AssertCacheCalledTimes(t, &mocks.CacheCallCounts{ExternalGets: 1, ExternalSets: 1})
+	})
+}
+
+func TestGetRefTargetRevisionMappingForCacheKey_OCINormalization(t *testing.T) {
+	// Regression: refSourceCommitSHAs is keyed with NormalizeRepoURL, which preserves the ".git"
+	// suffix for OCI URLs while git.NormalizeGitURL strips it. Looking the digest up with git
+	// normalization missed and blanked TargetRevision, so manifest generation ran at an empty revision.
+	repoURL := "oci://example.com/org/repo.git"
+	mapping := v1alpha1.RefTargetRevisionMapping{
+		"$values": {Repo: v1alpha1.Repository{Repo: repoURL}, TargetRevision: "1.0.0"},
+	}
+	shas := ResolvedRevisions{v1alpha1.NormalizeOCIURL(repoURL): "sha256:digest"}
+
+	res := getRefTargetRevisionMappingForCacheKey(mapping, shas)
+
+	assert.Equal(t, "sha256:digest", res["$values"].TargetRevision)
+}
+
+func TestAppDetailsCacheKey_IncludesResolvedRefRevisions(t *testing.T) {
+	// Regression: GetAppDetails used to pass nil resolved revisions, so moving a referenced tag (or
+	// changing a ref revision) produced the same key and returned stale Helm parameters from cache.
+	appSrc := &v1alpha1.ApplicationSource{Path: ".", Helm: &v1alpha1.ApplicationSourceHelm{ValueFiles: []string{"$values/values.yaml"}}}
+	repoURL := "oci://example.com/org/values"
+	srcRefs := v1alpha1.RefTargetRevisionMapping{
+		"$values": {Repo: v1alpha1.Repository{Repo: repoURL}, TargetRevision: "1.0.0"},
+	}
+
+	keyA := appDetailsCacheKey("rev", appSrc, srcRefs, v1alpha1.TrackingMethodLabel, ResolvedRevisions{v1alpha1.NormalizeOCIURL(repoURL): "sha256:aaa"})
+	keyB := appDetailsCacheKey("rev", appSrc, srcRefs, v1alpha1.TrackingMethodLabel, ResolvedRevisions{v1alpha1.NormalizeOCIURL(repoURL): "sha256:bbb"})
+	keyNil := appDetailsCacheKey("rev", appSrc, srcRefs, v1alpha1.TrackingMethodLabel, nil)
+
+	assert.NotEqual(t, keyA, keyB, "different resolved ref digests must produce different app-details cache keys")
+	assert.NotEqual(t, keyA, keyNil)
+}
+
+func TestGetRefTargetRevisionMappingForCacheKey_DoesNotMutateInput(t *testing.T) {
+	// Regression: the mapping holds *RefTarget pointers shared with the caller's request. Overwriting
+	// TargetRevision in place blanked it whenever no resolved revisions were supplied (GetAppDetails),
+	// so referenced sources were later resolved at "" instead of the configured revision.
+	mapping := v1alpha1.RefTargetRevisionMapping{
+		"$values": {Repo: v1alpha1.Repository{Repo: "https://github.com/org/repo.git"}, TargetRevision: "main"},
+	}
+
+	withResolved := getRefTargetRevisionMappingForCacheKey(mapping, ResolvedRevisions{"https://github.com/org/repo": "abc123"})
+	assert.Equal(t, "abc123", withResolved["$values"].TargetRevision)
+	assert.Equal(t, "main", mapping["$values"].TargetRevision, "input RefTarget must not be mutated")
+
+	withoutResolved := getRefTargetRevisionMappingForCacheKey(mapping, nil)
+	assert.Empty(t, withoutResolved["$values"].TargetRevision)
+	assert.Equal(t, "main", mapping["$values"].TargetRevision, "input RefTarget must not be mutated")
+}
+
+func TestGetOciDirectories(t *testing.T) {
+	t.Run("GetOciDirectories cache miss", func(t *testing.T) {
+		fixtures := newFixtures()
+		t.Cleanup(fixtures.mockCache.StopRedisCallback)
+		directories, err := fixtures.cache.GetOciDirectories("oci://ghcr.io/example/manifests", "v1.0.0")
+		require.ErrorIs(t, err, ErrCacheMiss)
+		assert.Empty(t, directories)
+		fixtures.mockCache.AssertCacheCalledTimes(t, &mocks.CacheCallCounts{ExternalGets: 1})
+	})
+	t.Run("GetOciDirectories cache miss local", func(t *testing.T) {
+		fixtures := newFixtures()
+		t.Cleanup(fixtures.mockCache.StopRedisCallback)
+		cache := fixtures.cache
+		expectedItem := []string{"test/dir", "test/dir2"}
+		err := cache.cache.SetItem(
+			ociDirectoriesKey("oci://ghcr.io/example/manifests", "v1.0.0"),
+			expectedItem,
+			&cacheutil.CacheActionOpts{Expiration: 30 * time.Second})
+		require.NoError(t, err)
+		directories, err := fixtures.cache.GetOciDirectories("oci://ghcr.io/example/manifests", "v1.0.0")
+		require.NoError(t, err)
+		assert.Equal(t, expectedItem, directories)
+		fixtures.mockCache.AssertCacheCalledTimes(t, &mocks.CacheCallCounts{ExternalGets: 1, ExternalSets: 1})
+	})
+
+	t.Run("GetOciDirectories cache hit local", func(t *testing.T) {
+		fixtures := newFixtures()
+		t.Cleanup(fixtures.mockCache.StopRedisCallback)
+		cache := fixtures.cache
+		expectedItem := []string{"test/dir", "test/dir2"}
+		err := cache.cache.SetItem(
+			ociDirectoriesKey("oci://ghcr.io/example/manifests", "v1.0.0"),
+			expectedItem,
+			&cacheutil.CacheActionOpts{Expiration: 30 * time.Second})
+		require.NoError(t, err)
+		directories, err := fixtures.cache.GetOciDirectories("oci://ghcr.io/example/manifests", "v1.0.0")
+		require.NoError(t, err)
+		assert.Equal(t, expectedItem, directories)
+		fixtures.mockCache.AssertCacheCalledTimes(t, &mocks.CacheCallCounts{ExternalGets: 1, ExternalSets: 1})
+	})
+
+	t.Run("SetOciDirectories", func(t *testing.T) {
+		fixtures := newFixtures()
+		t.Cleanup(fixtures.mockCache.StopRedisCallback)
+		expectedItem := []string{"test/dir", "test/dir2"}
+		err := fixtures.cache.SetOciDirectories("oci://ghcr.io/example/manifests", "v1.0.0", expectedItem)
+		require.NoError(t, err)
+		directories, err := fixtures.cache.GetOciDirectories("oci://ghcr.io/example/manifests", "v1.0.0")
+		require.NoError(t, err)
+		assert.Equal(t, expectedItem, directories)
+		fixtures.mockCache.AssertCacheCalledTimes(t, &mocks.CacheCallCounts{ExternalGets: 1, ExternalSets: 1})
+	})
+}
+
+func TestGetOciFiles(t *testing.T) {
+	t.Run("GetOciFiles cache miss", func(t *testing.T) {
+		fixtures := newFixtures()
+		t.Cleanup(fixtures.mockCache.StopRedisCallback)
+		files, err := fixtures.cache.GetOciFiles("oci://ghcr.io/example/manifests", "v1.0.0", "*.json")
+		require.ErrorIs(t, err, ErrCacheMiss)
+		assert.Empty(t, files)
+		fixtures.mockCache.AssertCacheCalledTimes(t, &mocks.CacheCallCounts{ExternalGets: 1})
+	})
+	t.Run("GetOciFiles cache hit", func(t *testing.T) {
+		fixtures := newFixtures()
+		t.Cleanup(fixtures.mockCache.StopRedisCallback)
+		cache := fixtures.cache
+		expectedItem := map[string][]byte{"test/file.json": []byte("\"test\":\"contents\""), "test/file1.json": []byte("\"test1\":\"contents1\"")}
+		err := cache.cache.SetItem(
+			ociFilesKey("oci://ghcr.io/example/manifests", "v1.0.0", "*.json"),
+			expectedItem,
+			&cacheutil.CacheActionOpts{Expiration: 30 * time.Second})
+		require.NoError(t, err)
+		files, err := fixtures.cache.GetOciFiles("oci://ghcr.io/example/manifests", "v1.0.0", "*.json")
+		require.NoError(t, err)
+		assert.Equal(t, expectedItem, files)
+		fixtures.mockCache.AssertCacheCalledTimes(t, &mocks.CacheCallCounts{ExternalGets: 1, ExternalSets: 1})
+	})
+
+	t.Run("SetOciFiles", func(t *testing.T) {
+		fixtures := newFixtures()
+		t.Cleanup(fixtures.mockCache.StopRedisCallback)
+		expectedItem := map[string][]byte{"test/file.json": []byte("\"test\":\"contents\""), "test/file1.json": []byte("\"test1\":\"contents1\"")}
+		err := fixtures.cache.SetOciFiles("oci://ghcr.io/example/manifests", "v1.0.0", "*.json", expectedItem)
+		require.NoError(t, err)
+		files, err := fixtures.cache.GetOciFiles("oci://ghcr.io/example/manifests", "v1.0.0", "*.json")
 		require.NoError(t, err)
 		assert.Equal(t, expectedItem, files)
 		fixtures.mockCache.AssertCacheCalledTimes(t, &mocks.CacheCallCounts{ExternalGets: 1, ExternalSets: 1})
