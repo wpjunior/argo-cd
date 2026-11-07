@@ -973,6 +973,10 @@ type refSourceResolveRequest struct {
 	// ociRefPaths receives the extracted OCI directory (keyed by normalizedRepoURL) for later value
 	// file resolution. Only used by the OCI resolver.
 	ociRefPaths utilio.TempPaths
+	// resolvedRevision, when set, is the digest the OCI ref was already resolved to earlier in the
+	// request (for the cache key). The OCI resolver extracts that digest instead of resolving the
+	// tag again, so the extracted content always matches the cache key it is stored under.
+	resolvedRevision string
 	// sourceRepoURL and sourceRevision describe the primary source when it is a Git source (empty
 	// otherwise). A Git ref to the same repository and revision reuses commitSHA instead of
 	// resolving the revision again.
@@ -1002,10 +1006,13 @@ func (s *Service) resolveOCIRefSource(ctx context.Context, req refSourceResolveR
 		return repoRef{}, nil, fmt.Errorf("failed to create OCI client for repo %s", refSourceMapping.Repo.Repo)
 	}
 
-	referencedDigest, err := ociClient.ResolveRevision(ctx, refSourceMapping.TargetRevision, req.noCache || req.noRevisionCache)
-	if err != nil {
-		log.Errorf("Failed to resolve OCI revision %s: %v", refSourceMapping.TargetRevision, err)
-		return repoRef{}, nil, fmt.Errorf("failed to resolve OCI revision %s", refSourceMapping.TargetRevision)
+	referencedDigest := req.resolvedRevision
+	if referencedDigest == "" {
+		referencedDigest, err = ociClient.ResolveRevision(ctx, refSourceMapping.TargetRevision, req.noCache || req.noRevisionCache)
+		if err != nil {
+			log.Errorf("Failed to resolve OCI revision %s: %v", refSourceMapping.TargetRevision, err)
+			return repoRef{}, nil, fmt.Errorf("failed to resolve OCI revision %s", refSourceMapping.TargetRevision)
+		}
 	}
 
 	ociPath, closer, err := ociClient.Extract(ctx, referencedDigest)
@@ -1098,8 +1105,10 @@ func (s *Service) resolveGitRefSource(ctx context.Context, req refSourceResolveR
 
 // extractOCIRefSource extracts an OCI $ref source into ociRefPaths, keyed by normalized repo URL,
 // which is how value file resolution looks it up. A repository already extracted for an earlier
-// $ref is reused, and referencing it at a second revision is rejected.
-func (s *Service) extractOCIRefSource(ctx context.Context, q *apiclient.RepoServerAppDetailsQuery, refName string, refSource *v1alpha1.RefTarget, refSources map[string]repoRef, ociRefPaths utilio.TempPaths) (goio.Closer, error) {
+// $ref is reused, and referencing it at a second revision is rejected. When resolvedRefRevisions
+// already holds the digest this repository was resolved to for the app-details cache key, that
+// digest is extracted, so the cached details always match the content they were computed from.
+func (s *Service) extractOCIRefSource(ctx context.Context, q *apiclient.RepoServerAppDetailsQuery, refName string, refSource *v1alpha1.RefTarget, refSources map[string]repoRef, ociRefPaths utilio.TempPaths, resolvedRefRevisions cache.ResolvedRevisions) (goio.Closer, error) {
 	normalizedRepoURL := refSource.Repo.NormalizeRepoURL()
 	if prevRef, ok := refSources[normalizedRepoURL]; ok {
 		if prevRef.revision != refSource.TargetRevision {
@@ -1114,6 +1123,7 @@ func (s *Service) extractOCIRefSource(ctx context.Context, q *apiclient.RepoServ
 		noCache:           q.NoCache,
 		noRevisionCache:   q.NoRevisionCache,
 		ociRefPaths:       ociRefPaths,
+		resolvedRevision:  resolvedRefRevisions[normalizedRepoURL],
 	})
 	if err != nil {
 		return nil, err
@@ -2730,7 +2740,7 @@ func (s *Service) GetAppDetails(ctx context.Context, q *apiclient.RepoServerAppD
 
 		switch appSourceType {
 		case v1alpha1.ApplicationSourceTypeHelm:
-			if err := s.populateHelmAppDetails(ctx, res, opContext.appPath, repoRoot, commitSHA, revision, q, s.gitRepoPaths); err != nil {
+			if err := s.populateHelmAppDetails(ctx, res, opContext.appPath, repoRoot, commitSHA, revision, q, s.gitRepoPaths, refSourceCommitSHAs); err != nil {
 				return err
 			}
 		case v1alpha1.ApplicationSourceTypeKustomize:
@@ -2788,7 +2798,7 @@ func (s *Service) createGetAppDetailsCacheHandler(res *apiclient.RepoAppDetailsR
 	}
 }
 
-func (s *Service) populateHelmAppDetails(ctx context.Context, res *apiclient.RepoAppDetailsResponse, appPath, repoRoot, commitSHA, revision string, q *apiclient.RepoServerAppDetailsQuery, gitRepoPaths utilio.TempPaths) error {
+func (s *Service) populateHelmAppDetails(ctx context.Context, res *apiclient.RepoAppDetailsResponse, appPath, repoRoot, commitSHA, revision string, q *apiclient.RepoServerAppDetailsQuery, gitRepoPaths utilio.TempPaths, resolvedRefRevisions cache.ResolvedRevisions) error {
 	var selectedValueFiles []string
 	var availableValueFiles []string
 
@@ -2840,7 +2850,7 @@ func (s *Service) populateHelmAppDetails(ctx context.Context, res *apiclient.Rep
 		for _, refName := range refNames {
 			refSource := q.RefSources[refName]
 			if refSource.Repo.IsOCI() {
-				closer, err := s.extractOCIRefSource(ctx, q, refName, refSource, refSources, ociRefPaths)
+				closer, err := s.extractOCIRefSource(ctx, q, refName, refSource, refSources, ociRefPaths, resolvedRefRevisions)
 				if err != nil {
 					return err
 				}
